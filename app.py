@@ -8,6 +8,12 @@ import tkinter as tk
 from tkinter import filedialog
 import os
 
+try:
+    import soundfile as sf
+    _HAS_SOUNDFILE = True
+except ImportError:
+    _HAS_SOUNDFILE = False
+
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
@@ -74,43 +80,45 @@ class FractionalDelay:
         self.N = len(self.buf)
 
     def process(self, x: np.ndarray, delay_samples: float) -> np.ndarray:
-        out = np.zeros_like(x, dtype=np.float32)
+        x = x.astype(np.float32)
+        n = len(x)
         d = float(clamp(delay_samples, 0.0, self.N - 2.0))
 
-        for i, xi in enumerate(x.astype(np.float32)):
-            self.buf[self.w] = xi
+        # Write all samples into the circular buffer (no feedback, so writes never
+        # corrupt reads: every read position is at least d >= 0 samples in the past).
+        end = self.w + n
+        if end <= self.N:
+            self.buf[self.w:end] = x
+        else:
+            split = self.N - self.w
+            self.buf[self.w:] = x[:split]
+            self.buf[:end - self.N] = x[split:]
 
-            r = self.w - d
-            if r < 0:
-                r += self.N
+        # Vectorized fractional read with linear interpolation.
+        read_float = (self.w + np.arange(n, dtype=np.float64) - d) % self.N
+        r0 = read_float.astype(np.int32)
+        frac = (read_float - r0).astype(np.float32)
+        r1 = (r0 + 1) % self.N
+        out = (1.0 - frac) * self.buf[r0] + frac * self.buf[r1]
 
-            r0 = int(r) % self.N
-            frac = r - int(r)
-            r1 = (r0 + 1) % self.N
-
-            out[i] = (1.0 - frac) * self.buf[r0] + frac * self.buf[r1]
-            self.w = (self.w + 1) % self.N
-
+        self.w = end % self.N
         return out
 
 class OnePoleLPF:
-    """Cheap one-pole low-pass (vectorized for performance)."""
+    """One-pole IIR low-pass: y[n] = a·y[n-1] + (1-a)·x[n]."""
     def __init__(self, fs: int):
         self.fs = fs
-        self.z = 0.0
+        self.z = 0.0  # previous output y[-1]
 
     def process(self, x: np.ndarray, cutoff_hz: float) -> np.ndarray:
         cutoff_hz = clamp(cutoff_hz, 80.0, self.fs * 0.45)
-        a = np.exp(-2.0 * np.pi * cutoff_hz / self.fs)
-        x = x.astype(np.float32)
-        # Vectorized filter: y[n] = a*y[n-1] + (1-a)*x[n]
-        # Using scipy.signal.lfilter would be ideal, but this is faster for one-pole
-        y = np.empty_like(x, dtype=np.float32)
-        y[0] = a * self.z + (1.0 - a) * x[0]
-        for i in range(1, len(x)):
-            y[i] = a * y[i-1] + (1.0 - a) * x[i]
-        self.z = y[-1]
-        return y
+        a = float(np.exp(-2.0 * np.pi * cutoff_hz / self.fs))
+        # H(z) = (1-a) / (1 - a·z⁻¹)
+        # Transposed direct-form II initial state: zi[0] = a · y[-1]
+        zi = np.array([a * self.z], dtype=np.float64)
+        y, _ = signal.lfilter([1.0 - a], [1.0, -a], x.astype(np.float64), zi=zi)
+        self.z = float(y[-1])
+        return y.astype(np.float32)
 
 class SimpleReverb:
     """
@@ -193,29 +201,29 @@ class Demo:
             return False
             
         try:
-            # Read WAV file
-            sample_rate, audio_data = wavfile.read(filepath)
-            
-            # Convert to float32 and normalize
-            if audio_data.dtype == np.int16:
-                audio_data = audio_data.astype(np.float32) / 32768.0
-            elif audio_data.dtype == np.int32:
-                audio_data = audio_data.astype(np.float32) / 2147483648.0
-            elif audio_data.dtype == np.uint8:
-                audio_data = (audio_data.astype(np.float32) - 128.0) / 128.0
-            elif audio_data.dtype == np.float32 or audio_data.dtype == np.float64:
-                audio_data = audio_data.astype(np.float32)
+            if _HAS_SOUNDFILE:
+                # soundfile handles WAV, FLAC, OGG, AIFF, AU, and many more.
+                # It returns float32 directly and normalises integer formats automatically.
+                audio_data, sample_rate = sf.read(filepath, dtype='float32', always_2d=False)
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.mean(axis=1)
             else:
-                audio_data = audio_data.astype(np.float32)
-                # Normalize to [-1, 1] range
-                max_val = np.abs(audio_data).max()
-                if max_val > 0:
-                    audio_data = audio_data / max_val
-            
-            # Convert to mono if stereo
-            if len(audio_data.shape) > 1:
-                audio_data = np.mean(audio_data, axis=1)
-            
+                # Fallback: scipy only supports WAV.
+                sample_rate, audio_data = wavfile.read(filepath)
+                if audio_data.dtype == np.int16:
+                    audio_data = audio_data.astype(np.float32) / 32768.0
+                elif audio_data.dtype == np.int32:
+                    audio_data = audio_data.astype(np.float32) / 2147483648.0
+                elif audio_data.dtype == np.uint8:
+                    audio_data = (audio_data.astype(np.float32) - 128.0) / 128.0
+                else:
+                    audio_data = audio_data.astype(np.float32)
+                    max_val = np.abs(audio_data).max()
+                    if max_val > 0:
+                        audio_data /= max_val
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.mean(axis=1)
+
             # Resample if sample rate doesn't match
             if sample_rate != self.fs:
                 num_samples = int(len(audio_data) * self.fs / sample_rate)
@@ -244,26 +252,25 @@ class Demo:
         # "frontness" in [-1, +1]: +1 in front, -1 behind
         frontness = float(np.dot(u, fwd))
 
-        # left/right pan from right-vector dot
-        right = np.array([np.cos(self.theta + np.pi/2), np.sin(self.theta + np.pi/2)], dtype=np.float32)
-        pan = float(clamp(-np.dot(u, right), -1.0, 1.0))
+        # Left/right pan: project source direction onto listener's true right vector.
+        # Rotating forward by -π/2 (clockwise) gives the correct right direction.
+        right = np.array([np.cos(self.theta - np.pi/2), np.sin(self.theta - np.pi/2)], dtype=np.float32)
+        pan = float(clamp(np.dot(u, right), -1.0, 1.0))  # +1 = fully right, -1 = fully left
 
-        # Equal-power panning
+        # Equal-power panning (sine/cosine law)
         gL = float(np.sqrt(0.5 * (1.0 - pan)))
         gR = float(np.sqrt(0.5 * (1.0 + pan)))
 
-        # ITD: more accurate calculation based on head size and angle
-        # ITD = (head_radius / speed_of_sound) * (angle + sin(angle))
-        # Simplified: use pan as proxy for angle, but with head radius consideration
-        angle_rad = np.arcsin(clamp(pan, -0.999, 0.999))
+        # ITD via Woodworth formula: ITD = (r/c) * (θ + sin θ)
+        angle_rad = float(np.arcsin(clamp(pan, -0.999, 0.999)))
         itd = (self.params.head_radius_m / self.params.speed_of_sound) * (angle_rad + np.sin(angle_rad))
         itd = clamp(itd, -self.params.max_itd, self.params.max_itd)
-        delayL_s = max(0.0,  itd)
-        delayR_s = max(0.0, -itd)
+        delayL_s = max(0.0,  itd)   # left ear delayed when source is to the right
+        delayR_s = max(0.0, -itd)   # right ear delayed when source is to the left
 
-        # Distance attenuation: inverse-square law with rolloff
-        # Realistic: 1/distance^2, but we add a rolloff to prevent extreme volumes
-        att = 1.0 / (1.0 + dist * dist * 0.5)
+        # Inverse-distance attenuation (1/r) — physically motivated and appropriate for small rooms.
+        # True 1/r^2 is too aggressive at the 2–4 m scale of this room.
+        att = self.params.min_dist / dist
 
         # === Psychoacoustic front/back cheat ===
         # behindness: 0 (front) -> 1 (behind)
@@ -311,24 +318,39 @@ class Demo:
     def generate_source_audio(self, source: AudioSource, frames: int) -> np.ndarray:
         """Generate or load audio for a single source."""
         if source.use_audio_file and source.audio_file_data is not None:
-            # Play loaded audio file
-            mono = np.zeros(frames, dtype=np.float32)
-            remaining = len(source.audio_file_data) - source.audio_file_pos
-            
-            if remaining > 0:
-                # Copy available samples
-                copy_len = min(frames, remaining)
-                mono[:copy_len] = source.audio_file_data[source.audio_file_pos:source.audio_file_pos + copy_len]
-                source.audio_file_pos += copy_len
-                
-                # Loop if we've reached the end
-                if source.audio_file_pos >= len(source.audio_file_data):
-                    source.audio_file_pos = 0
-                    # Fill remaining with beginning of file
-                    if copy_len < frames:
-                        remaining_after_loop = frames - copy_len
-                        mono[copy_len:] = source.audio_file_data[:remaining_after_loop]
-                        source.audio_file_pos = remaining_after_loop
+            # Doppler factor for audio files (pitch-shifts via variable playback speed).
+            v_d = (source.position - self.listener).astype(np.float32)
+            dist_d = float(max(np.linalg.norm(v_d), self.params.min_dist))
+            u_d = v_d / dist_d
+            rel_vel = float(np.dot(source.velocity - self.listener_vel, u_d))
+            doppler_factor = float(clamp(1.0 + rel_vel / self.params.speed_of_sound, 0.5, 2.0))
+
+            # Consume src_frames source samples to produce `frames` output samples.
+            # More samples consumed = higher perceived pitch (approaching source).
+            src_frames = max(1, int(round(frames * doppler_factor)))
+
+            # Read src_frames from the looping file buffer.
+            raw = np.zeros(src_frames, dtype=np.float32)
+            data = source.audio_file_data
+            pos = source.audio_file_pos
+            out_pos = 0
+            remaining = src_frames
+            while remaining > 0:
+                avail = len(data) - pos
+                take = min(remaining, avail)
+                raw[out_pos:out_pos + take] = data[pos:pos + take]
+                pos += take
+                out_pos += take
+                remaining -= take
+                if pos >= len(data):
+                    pos = 0
+            source.audio_file_pos = pos
+
+            # Resample to output block size (applies pitch shift).
+            if src_frames != frames:
+                mono = signal.resample(raw, frames).astype(np.float32)
+            else:
+                mono = raw
             return mono * source.gain
         else:
             # Generate noise and tone
@@ -426,10 +448,16 @@ class Demo:
                         # Load audio file
                         root = tk.Tk()
                         root.withdraw()  # Hide the main window
+                        if _HAS_SOUNDFILE:
+                            sf_glob = "*.wav *.flac *.ogg *.aiff *.aif *.au *.w64 *.rf64"
+                            title = "Select Audio File"
+                        else:
+                            sf_glob = "*.wav"
+                            title = "Select Audio File (WAV only — install soundfile for more formats)"
                         filepath = filedialog.askopenfilename(
-                            title="Select Audio File (WAV)",
+                            title=title,
                             filetypes=[
-                                ("WAV files", "*.wav"),
+                                ("Audio files", sf_glob),
                                 ("All files", "*.*")
                             ]
                         )
@@ -478,11 +506,6 @@ class Demo:
                         if len(self.sources) > 0 and self.selected_source_idx < len(self.sources):
                             source = self.sources[self.selected_source_idx]
                             source.paused = not source.paused
-                    elif event.key == pygame.K_SPACE or event.key == pygame.K_p:
-                        # Toggle pause for selected source
-                        if len(self.sources) > 0 and self.selected_source_idx < len(self.sources):
-                            source = self.sources[self.selected_source_idx]
-                            source.paused = not source.paused
 
             keys = pygame.key.get_pressed()
 
@@ -497,13 +520,13 @@ class Demo:
             # Move listener (WASD) relative to look direction
             # Forward/backward along look direction, left/right perpendicular
             fwd = np.array([np.cos(self.theta), np.sin(self.theta)], dtype=np.float32)
-            right = np.array([np.cos(self.theta + np.pi/2), np.sin(self.theta + np.pi/2)], dtype=np.float32)
-            
+            right = np.array([np.cos(self.theta - np.pi/2), np.sin(self.theta - np.pi/2)], dtype=np.float32)
+
             mv = np.array([0.0, 0.0], dtype=np.float32)
             if keys[pygame.K_w]: mv += fwd      # Forward
             if keys[pygame.K_s]: mv -= fwd      # Backward
-            if keys[pygame.K_a]: mv += right    # Left (strafe)
-            if keys[pygame.K_d]: mv -= right    # Right (strafe)
+            if keys[pygame.K_a]: mv -= right    # Left (strafe)
+            if keys[pygame.K_d]: mv += right    # Right (strafe)
             
             n = float(np.linalg.norm(mv))
             if n > 0:
@@ -610,7 +633,8 @@ class Demo:
                     audio_info = f"Source {self.selected_source_idx+1}: {selected_source.audio_file_name} (L=load)"
                     screen.blit(font.render(audio_info, True, (0, 100, 0)), (18, 66))
                 else:
-                    audio_info = f"Source {self.selected_source_idx+1}: Noise/Tone (L=load audio)"
+                    fmt_hint = "WAV/FLAC/OGG/AIFF" if _HAS_SOUNDFILE else "WAV"
+                    audio_info = f"Source {self.selected_source_idx+1}: Noise/Tone (L=load {fmt_hint})"
                     screen.blit(font.render(audio_info, True, (100, 100, 100)), (18, 66))
 
             pygame.display.flip()
